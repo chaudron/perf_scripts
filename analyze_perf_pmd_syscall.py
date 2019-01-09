@@ -43,6 +43,7 @@
 #      perf script -s analyze_perf_pmd_syscall.py /usr/sbin/ovs-vswitchd
 #
 #    NOTE: The above only works if the /usr/sbin/ovs-vswitchd has debug symbols
+#          or debug symbols are available in /usr/lib/debug/.build-id/
 #
 
 
@@ -76,24 +77,48 @@ all_functions = dict()
 
 
 #
-# Read in all elf symbols for Functions()
+# Read symbols from obj file
 #
-def elf_import(file):
+def read_symbols(file):
     functions = dict()
     function_re = "([0-9a-fA-F]+) ......F \.text\s+([0-9a-fA-F]+)\s+(.*)\s*.*"
+    no_symbols_re = "^no symbols$"
 
     total_functions = 0
     output = subprocess.check_output(['objdump', '-t', file]).split('\n')
     for line in output:
+        if re.match(no_symbols_re, line):
+            return None
+
         match = re.match(function_re, line)
         if match is not None:
             if match.group(3) not in functions:
                 functions[match.group(3)] = [int(match.group(1), 16),
                                              int(match.group(2), 16)]
-                total_functions += 1
+
+    return functions
+
+#
+# Read in all elf symbols for Functions()
+#
+def elf_import(file):
+
+    functions = read_symbols(file)
+
+    if (functions == None):
+        output = subprocess.check_output(['readelf', '-n', file])
+        match = re.search("Build ID: ([0-9a-fA-F]+)", output)
+        if match is None:
+            sys.exit("ERROR: Can't find build ID to read debug symbols!")
+
+        dbg_file = "/usr/lib/debug/.build-id/{}/{}.debug".format(
+            match.group(1)[:2], match.group(1)[2:])
+        print("- No symbols in binary file, will try \"{}\"".format(dbg_file))
+
+        functions = read_symbols(dbg_file)
 
     print("- Done reading binary elf symbols, total of {} functions found.".
-          format(total_functions))
+          format(len(functions)))
 
     return functions
 
@@ -127,8 +152,10 @@ def addr2line(file, pc):
     if pc in __addr2line_cache[file]:
         return __addr2line_cache[file][pc]
 
-    output = subprocess.check_output(['addr2line', '-p', '-f', '-i',
-                                      '-e', file, hex(pc)]).split('\n')[0]
+    with open(os.devnull, 'w') as devnull:
+        output = subprocess.check_output(['addr2line', '-p', '-f', '-i',
+                                          '-e', file, hex(pc)],
+                                         stderr=devnull).split('\n')[0]
 
     __addr2line_cache[file][pc] = output
     return output
