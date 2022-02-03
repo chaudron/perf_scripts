@@ -28,7 +28,7 @@
 #    4 April 2018
 #
 #  Usage:
-#    perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY>
+#    perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY> [<OVS_ADDR_OFFSET]
 #
 #  Example:
 #    Capture perf data for example from Open vSwitch's PMD threads with the
@@ -36,7 +36,9 @@
 #
 #      perf record -e raw_syscalls:sys_enter -s --call-graph dwarf \
 #        --per-thread -g -i -t \
-#        `ps -To tid,comm \`pidof ovs-vswitchd\` | grep pmd | awk '{$1=$1};1' | cut -d " " -f 1 | xargs | sed -e 's/ /,/g'`
+#        `ps -To tid,comm \`pidof ovs-vswitchd\` | \
+#        grep pmd | awk '{$1=$1};1' | cut -d " " -f 1 | xargs | \
+#        sed -e 's/ /,/g'`
 #
 #    Once the data is in, execute the following to generate a report:
 #
@@ -45,7 +47,22 @@
 #    NOTE: The above only works if the /usr/sbin/ovs-vswitchd has debug symbols
 #          or debug symbols are available in /usr/lib/debug/.build-id/
 #
-
+#    NOTE: Based on the kernel version/configuration the ovs-vswitchd reported
+#          instruction pointer might not be at a zero offset, causing the
+#          addr2line lookups to fail. If this is the case, the backtrace
+#          output will have entries like
+#          "seq_read() @ <source information unknown>". To fix this, you could
+#          manually add the offset to the script. The information we need is
+#          available in the trace data, but unfortunately not available
+#          directly through the script. Here we assume a single ovs-vswitchd
+#          daemon was running and was not restarted during the trace capture:
+#
+#            $ perf script -i perf_entry.data --show-mmap-events | \
+#              grep "r-xp /usr/sbin/ovs-vswitchd"
+#            ovs-vswitchd     0 [000]     0.000000: PERF_RECORD_MMAP2 283211/283211: [0x5573647bd000(0xc4c000) @ 0 fd:00 67462292 0]: r-xp /usr/sbin/ovs-vswitchd     # noqa: E501
+#
+#          You need the use the 0x5573647bd000 value as the <OVS_ADD_OFFSET>.
+#
 
 #
 # Global imports
@@ -63,8 +80,8 @@ import sys
 sys.path.append(os.environ['PERF_EXEC_PATH'] +
                 '/scripts/python/Perf-Trace-Util/lib/Perf/Trace')
 
-from Core import autodict
-from Util import syscall_name
+from Core import autodict         # noqa: E402
+from Util import syscall_name     # noqa: E402
 
 
 #
@@ -74,6 +91,8 @@ __addr2line_cache = dict()
 all_backtraces = autodict()
 all_syscalls = autodict()
 all_functions = dict()
+ovs_address_offset = 0
+processed_events = 0
 
 
 #
@@ -81,11 +100,12 @@ all_functions = dict()
 #
 def read_symbols(file):
     functions = dict()
-    function_re = "([0-9a-fA-F]+) ......F \.text\s+([0-9a-fA-F]+)\s+(.*)\s*.*"
-    no_symbols_re = "^no symbols$"
+    function_re = r"([0-9a-fA-F]+) ......F \.text\s+([0-9a-fA-F]+)\s+(.*)\s*.*"
+    no_symbols_re = r"^no symbols$"
 
-    total_functions = 0
-    output = subprocess.check_output(['objdump', '-t', file]).split('\n')
+    output = subprocess.check_output(['objdump', '-t', file]). \
+        decode('utf-8').split('\n')
+
     for line in output:
         if re.match(no_symbols_re, line):
             return None
@@ -98,16 +118,16 @@ def read_symbols(file):
 
     return functions
 
+
 #
 # Read in all elf symbols for Functions()
 #
 def elf_import(file):
-
     functions = read_symbols(file)
 
-    if (functions == None):
+    if functions is None:
         output = subprocess.check_output(['readelf', '-n', file])
-        match = re.search("Build ID: ([0-9a-fA-F]+)", output)
+        match = re.search("Build ID: ([0-9a-fA-F]+)", output.decode('utf-8'))
         if match is None:
             sys.exit("ERROR: Can't find build ID to read debug symbols!")
 
@@ -116,6 +136,10 @@ def elf_import(file):
         print("- No symbols in binary file, will try \"{}\"".format(dbg_file))
 
         functions = read_symbols(dbg_file)
+
+        # Not the best way, but it will do for now...
+        global bin_file
+        bin_file = dbg_file
 
     print("- Done reading binary elf symbols, total of {} functions found.".
           format(len(functions)))
@@ -127,23 +151,33 @@ def elf_import(file):
 # Translate perf record IP (instruction pointer) into offset using objdump data
 #
 def translate_perf_ip_2_user_address(functions, name, start, end, ip):
+    if name not in functions:
+        return -1
 
-    if name in functions:
-        if (end - start) != functions[name][1]:
-            return -1
+    function_start = functions[name][0]
+    function_end = function_start + functions[name][1]
 
-        return ip - start + functions[name][0]
-    else:
+    if function_start != start or function_end != end:
         return -2
 
-    return 0
+    #
+    # We have to use this ugly ovs_address_offset here are we do not have
+    # access to the offset, or map information. See the following for more
+    # details on what we miss:
+    #   https://elixir.bootlin.com/linux/v5.16.5/source/tools/perf/util/scripting-engines/trace-event-python.c#L736
+    #
+    address = ip - ovs_address_offset
+
+    if address >= start and address <= end:
+        return address
+
+    return -3
 
 
 #
 # addr2line with cache
 #
 def addr2line(file, pc):
-
     global __addr2line_cache
 
     if file not in __addr2line_cache:
@@ -155,7 +189,8 @@ def addr2line(file, pc):
     with open(os.devnull, 'w') as devnull:
         output = subprocess.check_output(['addr2line', '-p', '-f', '-i',
                                           '-e', file, hex(pc)],
-                                         stderr=devnull).split('\n')[0]
+                                         stderr=devnull). \
+                                         decode('utf-8').split('\n')[0]
 
     __addr2line_cache[file][pc] = output
     return output
@@ -163,20 +198,24 @@ def addr2line(file, pc):
 
 #
 # Get instruction pointers source code info, if exists
-#
 def get_ip_source_info(node):
-
     if 'sym' in node:
         faddr = translate_perf_ip_2_user_address(all_functions,
                                                  node['sym']['name'],
                                                  node['sym']['start'],
                                                  node['sym']['end'],
                                                  node['ip'])
+
+        if faddr == -1:
+            # This is a none OVS symbol and we do not want to return it.
+            return None
+
         if faddr > 0:
             source_line = addr2line(bin_file, faddr)
             if source_line is not None and source_line != "":
                 return source_line
-    return None
+
+        return "<source information unknown>"
 
 
 #
@@ -204,20 +243,18 @@ def show_syscall_summary():
     print("{:40}  {:>10}".format("----------------------------------------",
                                  "----------"))
 
-    for id, id_val in sorted(all_syscalls.iteritems(),
-                             key=lambda(k, v): (v, k),
-                             reverse=True):
+    for id, id_val in sorted(all_syscalls.items(), reverse=True):
 
         total = 0
         print("{:40}".format(syscall_name(id)))
 
-        for comm, comm_val in sorted(id_val.iteritems(),
-                                     key=lambda(k, v): (v, k)):
+        for comm, comm_val in sorted(id_val.items(),
+                                     key=lambda kv: (kv[1], kv[0])):
             print("    {:36}  {:>10}".format(comm, comm_val))
             total += comm_val
 
         print("    {:36}  {:>10}+".format("", "-" * len(str(total))))
-        print("    {:36}  {:>10}".format("TOTAL", total))
+        print("    {:36}  {:>10}\n".format("TOTAL", total))
 
 
 #
@@ -227,9 +264,7 @@ def show_callback_results():
     print("\nCALLBACK events:")
     print("================\n")
 
-    for bt, bt_val in sorted(all_backtraces.iteritems(),
-                             key=lambda(k, v): (v, k)):
-
+    for bt, bt_val in sorted(all_backtraces.items()):
         bt_list = ast.literal_eval(bt)
         for i, bt_entry in enumerate(bt_list):
             print("#{:<2} {}() @ {}".format(i, bt_entry[0], bt_entry[1]))
@@ -239,14 +274,12 @@ def show_callback_results():
               format("----------------------------------------",
                      "----------"))
 
-        for id, id_val in sorted(bt_val.iteritems(),
-                                 key=lambda(k, v): (v, k),
-                                 reverse=True):
+        for id, id_val in sorted(bt_val.items(), reverse=True):
             total = 0
             print("  {:40}".format(syscall_name(id)))
 
-            for comm, comm_val in sorted(id_val.iteritems(),
-                                         key=lambda(k, v): (v, k)):
+            for comm, comm_val in sorted(id_val.items(),
+                                         key=lambda kv: (kv[1], kv[0])):
                 print("      {:36}  {:>10}".format(comm, comm_val))
                 total += comm_val
 
@@ -269,6 +302,7 @@ def trace_begin():
 # End of the trace, show results
 #
 def trace_end():
+    print("- Done processing {} sys_enter events.".format(processed_events))
     print("- Results:")
     show_syscall_summary()
     show_callback_results()
@@ -280,6 +314,9 @@ def trace_end():
 def raw_syscalls__sys_enter(event_name, context, common_cpu,
                             common_secs, common_nsecs, common_pid,
                             common_comm, common_callchain, id, args):
+    global processed_events
+
+    processed_events += 1
 
     try:
         all_syscalls[id][common_comm] += 1
@@ -298,14 +335,17 @@ def raw_syscalls__sys_enter(event_name, context, common_cpu,
 # Show warning when unhandled events are encountered
 #
 def trace_unhandled(event_name, context, event_fields_dict):
-    print("WARNING: Unknown event: {}".format(event_name))
+    if event_name != "raw_syscalls__sys_exit":
+        print("WARNING: Unknown event: {}".format(event_name))
 
 
 #
 # Handle command line argument
 #
-
-if len(sys.argv) != 2:
-    sys.exit("perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY>")
+if len(sys.argv) < 2 or len(sys.argv) > 3:
+    sys.exit("perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY> "
+             "[<OVS_ADD_OFFSET]")
 
 bin_file = sys.argv[1]
+if len(sys.argv) > 2:
+    ovs_address_offset = int(sys.argv[2], 0)
