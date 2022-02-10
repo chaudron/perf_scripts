@@ -28,7 +28,8 @@
 #    4 April 2018
 #
 #  Usage:
-#    perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY> [<OVS_ADDR_OFFSET]
+#    perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY> \
+#        [<OVS_ADDR_OFFSET] [SYSCALL_DEBUG]
 #
 #  Example:
 #    Capture perf data for example from Open vSwitch's PMD threads with the
@@ -93,6 +94,7 @@ all_syscalls = autodict()
 all_functions = dict()
 ovs_address_offset = 0
 processed_events = 0
+syscall_debug = 0
 
 
 #
@@ -223,7 +225,12 @@ def get_ip_source_info(node):
 #
 def get_ovs_backtrace_only(callchain):
     bin_callchain = list()
+    if syscall_debug > 0:
+        print("DBG[{}]: Callchain dump:".format(syscall_debug))
     for node in callchain:
+        if syscall_debug > 0:
+            print("DBG[{}]:   {}".format(syscall_debug, node))
+
         if 'sym' in node:
             source = get_ip_source_info(node)
             if source is not None:
@@ -269,6 +276,9 @@ def show_callback_results():
         for i, bt_entry in enumerate(bt_list):
             print("#{:<2} {}() @ {}".format(i, bt_entry[0], bt_entry[1]))
 
+        if len(bt_list) == 0:
+            print("      !! NO OVS CALLBACK CHAIN FOUND !!")
+
         print("\n  {:40}  {:>10}".format("Syscall", "Count"))
         print("  {:40}  {:>10}".
               format("----------------------------------------",
@@ -276,7 +286,7 @@ def show_callback_results():
 
         for id, id_val in sorted(bt_val.items(), reverse=True):
             total = 0
-            print("  {:40}".format(syscall_name(id)))
+            print("  {}/{}".format(syscall_name(id), id))
 
             for comm, comm_val in sorted(id_val.items(),
                                          key=lambda kv: (kv[1], kv[0])):
@@ -316,6 +326,9 @@ def raw_syscalls__sys_enter(event_name, context, common_cpu,
                             common_comm, common_callchain, id, args):
     global processed_events
 
+    if syscall_debug > 0 and id != syscall_debug:
+        return
+
     processed_events += 1
 
     try:
@@ -342,10 +355,12 @@ def trace_unhandled(event_name, context, event_fields_dict):
 #
 # Handle command line argument
 #
-if len(sys.argv) < 2 or len(sys.argv) > 3:
+if len(sys.argv) < 2 or len(sys.argv) > 4:
     sys.exit("perf script -s analyze_perf_pmd_syscall.py <ELF_BINARY> "
              "[<OVS_ADD_OFFSET]")
 
 bin_file = sys.argv[1]
 if len(sys.argv) > 2:
     ovs_address_offset = int(sys.argv[2], 0)
+if len(sys.argv) > 3:
+    syscall_debug = int(sys.argv[3], 0)
