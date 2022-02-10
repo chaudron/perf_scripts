@@ -159,6 +159,14 @@ def translate_perf_ip_2_user_address(functions, name, start, end, ip):
     function_start = functions[name][0]
     function_end = function_start + functions[name][1]
 
+    if ip < function_end:
+        # This is the old style offset/address calculation, and we just need to
+        # return the ip value. The only thing we can verify is that the code
+        # block is the same size.
+        if (end - start) != functions[name][1]:
+            return -2
+        return ip
+
     if function_start != start or function_end != end:
         return -2
 
