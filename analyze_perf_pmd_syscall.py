@@ -64,6 +64,9 @@
 #
 #          You need the use the 0x5573647bd000 value as the <OVS_ADD_OFFSET>.
 #
+#    NOTE: In addition you need the following Python packages:
+#         pip install text_histogram3
+#
 
 #
 # Global imports
@@ -81,20 +84,24 @@ import sys
 sys.path.append(os.environ['PERF_EXEC_PATH'] +
                 '/scripts/python/Perf-Trace-Util/lib/Perf/Trace')
 
-from Core import autodict         # noqa: E402
-from Util import syscall_name     # noqa: E402
+from Core import autodict              # noqa: E402
+from Util import syscall_name          # noqa: E402
+from text_histogram3 import histogram  # noqa: E402
 
 
 #
 # Global variables
 #
 __addr2line_cache = dict()
-all_backtraces = autodict()
+all_backtraces = dict()
 all_syscalls = autodict()
 all_functions = dict()
+all_syscall_exits = dict()
 ovs_address_offset = 0
 processed_events = 0
 syscall_debug = 0
+trace_start_ts = None
+trace_end_ts = None
 
 
 #
@@ -248,6 +255,30 @@ def get_ovs_backtrace_only(callchain):
 
 
 #
+# show_histogram()
+#
+def show_histogram(data_set, description=None, minimum=None, maximum=None,
+                   buckets=None, custbuckets=None):
+    if description is not None:
+        print("\n=> {}:".format(description))
+
+    if len(data_set) == 0:
+        print("# NumSamples = 0")
+    elif len(data_set) == 1:
+        print("# NumSamples = 1; Min = {0:.4f}; Max = {0:.4f}".
+              format(data_set[0]))
+    elif len(set(data_set)) == 1 and maximum is None and minimum is None and \
+            custbuckets is None:
+        histogram(data_set, buckets=buckets, minimum=list(set(data_set))[0],
+                  maximum=list(set(data_set))[0] + 1)
+    else:
+        histogram(data_set, buckets=buckets,
+                  minimum=minimum, maximum=maximum, custbuckets=custbuckets)
+
+    print("# Total for all samples = {}".format(sum(data_set)))
+
+
+#
 # Get syscall summary
 #
 def show_syscall_summary():
@@ -298,13 +329,65 @@ def show_callback_results():
 
             for comm, comm_val in sorted(id_val.items(),
                                          key=lambda kv: (kv[1], kv[0])):
-                print("      {:36}  {:>10}".format(comm, comm_val))
-                total += comm_val
+                print("      {:36}  {:>10}".format(comm, len(comm_val)))
+                total += len(comm_val)
 
             print("      {:36}  {:>10}+".format("", "-" * len(str(total))))
             print("      {:36}  {:>10}".format("TOTAL", total))
 
         print("\n")
+
+
+#
+# Show syscall duration histogram statistics
+#
+def show_duration_stats():
+    print("\nCALLBACK statistics:")
+    print("====================\n")
+
+    syscall_deltas = dict()
+
+    for bt, bt_val in sorted(all_backtraces.items()):
+        bt_list = ast.literal_eval(bt)
+        for i, bt_entry in enumerate(bt_list):
+            print("#{:<2} {}() @ {}".format(i, bt_entry[0], bt_entry[1]))
+
+        if len(bt_list) == 0:
+            print("      !! NO OVS CALLBACK CHAIN FOUND !!")
+
+        for id, id_val in sorted(bt_val.items(), reverse=True):
+            delta_values = []
+            for comm, comm_val in sorted(id_val.items(),
+                                         key=lambda kv: (kv[1], kv[0])):
+
+                for ts in comm_val:
+                    # Find first exit() entry after this timestamp
+                    if not (id in all_syscall_exits
+                            and comm in all_syscall_exits[id]):
+                        continue
+                    for exit_ts in all_syscall_exits[id][comm]:
+                        if exit_ts < ts:
+                            continue
+                        delta_values.append((exit_ts - ts) / 1000)
+                        break
+
+            show_histogram(delta_values,
+                           "Syscall: {}/{} (duration in microseconds)".format(
+                               syscall_name(id), id))
+
+            if id not in syscall_deltas:
+                syscall_deltas[id] = list()
+            syscall_deltas[id].extend(delta_values)
+
+        print("\n")
+
+    print("\nSYSCALL statistics:")
+    print("===================\n")
+
+    for id, data_set in sorted(syscall_deltas.items(), reverse=True):
+        show_histogram(data_set,
+                       "Syscall: {}/{} (duration in microseconds)".format(
+                           syscall_name(id), id))
 
 
 #
@@ -321,9 +404,16 @@ def trace_begin():
 #
 def trace_end():
     print("- Done processing {} sys_enter events.".format(processed_events))
+    if trace_start_ts is not None and trace_end_ts is not None:
+        s, ns = divmod(trace_end_ts - trace_start_ts, 1000000000)
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        print("- Trace runtime: {:d}:{:02d}:{:02d}.{:09d}".format(
+            h, m, s, ns))
     print("- Results:")
     show_syscall_summary()
     show_callback_results()
+    show_duration_stats()
 
 
 #
@@ -333,9 +423,13 @@ def raw_syscalls__sys_enter(event_name, context, common_cpu,
                             common_secs, common_nsecs, common_pid,
                             common_comm, common_callchain, id, args):
     global processed_events
+    global trace_start_ts
 
     if syscall_debug > 0 and id != syscall_debug:
         return
+
+    if trace_start_ts is None:
+        trace_start_ts = (common_secs * 1000000000) + common_nsecs
 
     processed_events += 1
 
@@ -346,18 +440,42 @@ def raw_syscalls__sys_enter(event_name, context, common_cpu,
 
     bt = get_ovs_backtrace_only(common_callchain)
     if bt is not None:
-        try:
-            all_backtraces[str(bt)][id][common_comm] += 1
-        except TypeError:
-            all_backtraces[str(bt)][id][common_comm] = 1
+        if str(bt) not in all_backtraces:
+            all_backtraces[str(bt)] = dict()
+        if id not in all_backtraces[str(bt)]:
+            all_backtraces[str(bt)][id] = dict()
+        if common_comm not in all_backtraces[str(bt)][id]:
+            all_backtraces[str(bt)][id][common_comm] = list()
+
+        all_backtraces[str(bt)][id][common_comm].append(
+            (common_secs * 1000000000) + common_nsecs)
+
+
+#
+# Callback for syscall events
+#
+def raw_syscalls__sys_exit(event_name, context, common_cpu,
+                           common_secs, common_nsecs, common_pid,
+                           common_comm, common_callchain, id, args):
+    global trace_end_ts
+
+    if id not in all_syscall_exits:
+        all_syscall_exits[id] = dict()
+    if common_comm not in all_syscall_exits[id]:
+        all_syscall_exits[id][common_comm] = list()
+
+    all_syscall_exits[id][common_comm].append((common_secs * 1000000000) +
+                                              common_nsecs)
+
+    if trace_start_ts is not None:
+        trace_end_ts = (common_secs * 1000000000) + common_nsecs
 
 
 #
 # Show warning when unhandled events are encountered
 #
 def trace_unhandled(event_name, context, event_fields_dict):
-    if event_name != "raw_syscalls__sys_exit":
-        print("WARNING: Unknown event: {}".format(event_name))
+    print("WARNING: Unknown event: {}".format(event_name))
 
 
 #
