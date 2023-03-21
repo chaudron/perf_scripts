@@ -18,8 +18,8 @@
 import os
 import sys
 
-sys.path.append(os.environ['PERF_EXEC_PATH'] + 
-	            '/scripts/python/Perf-Trace-Util/lib/Perf/Trace')
+sys.path.append(os.environ['PERF_EXEC_PATH'] +
+                '/scripts/python/Perf-Trace-Util/lib/Perf/Trace')
 
 from perf_trace_context import *
 from Core import *
@@ -30,25 +30,25 @@ total = 0
 events = 0
 
 def trace_begin():
-	print "in trace_begin"
+    print("in trace_begin")
 
 def trace_end():
     global total
     global events
 
-    print "in trace_end"
-    print "average {} ns".format(total/events)
+    print("in trace_end")
+    print("average {} ns".format(total/events))
 
-def probe__cp_in(event_name, context, common_cpu,
-	common_secs, common_nsecs, common_pid, common_comm,
-	common_callchain, __probe_ip):
+def probe_ovs__pmdrcuq_in(event_name, context, common_cpu,
+    common_secs, common_nsecs, common_pid, common_comm,
+    common_callchain, __probe_ip):
 
     global last_in
     last_in[common_cpu] = (common_secs * 1000000000) + common_nsecs
 
-def probe__cp_out(event_name, context, common_cpu,
-	common_secs, common_nsecs, common_pid, common_comm,
-	common_callchain, __probe_func, __probe_ret_ip):
+def probe_ovs__pmdrcuq_out__return(event_name, context, common_cpu,
+    common_secs, common_nsecs, common_pid, common_comm,
+    common_callchain, __probe_func, __probe_ret_ip):
 
     global last_in
     global total
@@ -57,16 +57,17 @@ def probe__cp_out(event_name, context, common_cpu,
     if common_cpu in last_in:
         last_out = (common_secs * 1000000000) + common_nsecs
         delta = (last_out - last_in[common_cpu])
-        #print "{}, {}".format(delta, common_cpu)
-        print delta
+        #print("{}, {}".format(delta, common_cpu))
+        print(delta)
         total += delta
         events += 1
         del last_in[common_cpu]
 
 
 def trace_unhandled(event_name, context, event_fields_dict):
-		print ' '.join(['%s=%s'%(k,str(v))for k,v in sorted(event_fields_dict.items())])
+    print(event_name)
+    print(' '.join(['%s=%s'%(k,str(v))for k,v in sorted(event_fields_dict.items())]))
 
 def print_header(event_name, cpu, secs, nsecs, pid, comm):
-	print "%-20s %5u %05u.%09u %8u %-20s " % \
-	(event_name, cpu, secs, nsecs, pid, comm),
+    print("%-20s %5u %05u.%09u %8u %-20s " %
+          (event_name, cpu, secs, nsecs, pid, comm))
